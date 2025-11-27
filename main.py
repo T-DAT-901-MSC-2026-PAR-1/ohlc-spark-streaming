@@ -9,6 +9,7 @@ from pyspark.sql.functions import (
     struct,
     concat,
     lit,
+    from_unixtime,
 )
 from pyspark.sql.types import (
     StructType,
@@ -16,6 +17,7 @@ from pyspark.sql.types import (
     StringType,
     DoubleType,
     TimestampType,
+    LongType,
 )
 
 # Configuration via environment variables (reasonable defaults)
@@ -44,6 +46,9 @@ def build_spark() -> SparkSession:
 
 
 def get_parsed_trade_schema() -> StructType:
+    """Schema for parsing Kafka JSON messages.
+    Note: All numeric fields are stored as strings in the JSON.
+    We'll convert them to proper types after parsing."""
     return StructType([
         StructField("type", StringType()),
         StructField("market", StringType()),
@@ -51,14 +56,14 @@ def get_parsed_trade_schema() -> StructType:
         StructField("to_symbol", StringType()),
         StructField("flags", StringType()),
         StructField("trade_id", StringType()),
-        StructField("timestamp", TimestampType()),
-        StructField("quantity", DoubleType()),
-        StructField("price", DoubleType()),
-        StructField("total_value", DoubleType()),
-        StructField("received_ts", TimestampType()),
+        StructField("timestamp", StringType()),  # Will convert to timestamp
+        StructField("quantity", StringType()),   # Will convert to double
+        StructField("price", StringType()),      # Will convert to double
+        StructField("total_value", StringType()),  # Will convert to double
+        StructField("received_ts", StringType()),  # Will convert to timestamp
         StructField("ccseq", StringType()),
-        StructField("timestamp_ns", TimestampType()),
-        StructField("received_ts_ns", TimestampType()),
+        StructField("timestamp_ns", StringType()),
+        StructField("received_ts_ns", StringType()),
     ])
 
 
@@ -81,19 +86,44 @@ if __name__ == "__main__":
 
     input_df: DataFrame = reader.option("startingOffsets", "earliest").load()
 
+    # DEBUG: Check raw Kafka messages
+    debug_kafka_raw = (
+        input_df.selectExpr("topic", "CAST(value AS STRING) as value_str")
+        .writeStream
+        .format("console")
+        .option("truncate", "false")
+        .option("numRows", "3")
+        .outputMode("append")
+        .queryName("debug_kafka_raw")
+        .start()
+    )
+
     # Parse JSON value
     parsed = input_df.select(
         col("topic"),
         from_json(col("value").cast("string"), parsed_trade_schema).alias("data"),
     )
 
+    # DEBUG: Check parsed data structure
+    debug_parsed = (
+        parsed.selectExpr("topic", "data.*")
+        .writeStream
+        .format("console")
+        .option("truncate", "false")
+        .option("numRows", "3")
+        .outputMode("append")
+        .queryName("debug_parsed")
+        .start()
+    )
+
     trades_df = parsed.select(
         col("topic"),
         col("data.from_symbol").alias("from_symbol"),
         col("data.to_symbol").alias("to_symbol"),
-        col("data.timestamp").alias("timestamp"),
-        col("data.price").alias("price"),
-        col("data.quantity").alias("quantity"),
+        # Convert Unix epoch seconds (stored as string) to TimestampType
+        from_unixtime(col("data.timestamp").cast("long")).cast("timestamp").alias("timestamp"),
+        col("data.price").cast("double").alias("price"),
+        col("data.quantity").cast("double").alias("quantity"),
     ).where(col("timestamp").isNotNull())
 
     # Extract base from topic name parsed-trades-<base>-usdt
@@ -103,6 +133,18 @@ if __name__ == "__main__":
         expr(
             f"CASE WHEN topic RLIKE 'parsed-trades-.+-usdt' THEN regexp_extract(topic, 'parsed-trades-([^\\-]+)-usdt', 1) ELSE from_symbol END"
         ),
+    )
+
+    # DEBUG: Print trades before aggregation to check data
+    debug_raw_trades = (
+        trades_df
+        .writeStream
+        .format("console")
+        .option("truncate", "false")
+        .option("numRows", "5")
+        .outputMode("append")
+        .queryName("debug_raw_trades")
+        .start()
     )
 
     # Compute 1-minute OHLC per base
@@ -145,18 +187,13 @@ if __name__ == "__main__":
         ).alias("value"),
     )
 
-    # Write to Kafka. Kafka sink uses the 'topic' column to route if present.
-    # Use 'append' mode since Kafka sink doesn't support 'update' mode
-    # Watermark ensures that windows are closed and emitted once they're complete
-    # Important: column order must be topic, key, value (as per Kafka documentation)
-    
     # DEBUG: Add console sink to see what's being written
     debug_query = (
         out.selectExpr("topic", "CAST(key AS STRING)", "CAST(value AS STRING)")
         .writeStream
         .format("console")
         .option("truncate", "false")
-        .outputMode("append")
+        .outputMode("update")
         .queryName("console_debug")
         .start()
     )
@@ -175,32 +212,10 @@ if __name__ == "__main__":
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
         .option("checkpointLocation", kafka_checkpoint)
         .queryName("kafka_sink")
-        .outputMode("append")
+        .outputMode("update")
         .start()
     )
 
-    # Print streaming query status periodically for debugging
-    import time
-    # Print started queries info to map them easily to the Spark UI (name/id/runId)
-    try:
-        print(f"[DEBUG] Started debug_query name={getattr(debug_query, 'name', None)} id={debug_query.id} runId={debug_query.runId}")
-    except Exception:
-        print(f"[DEBUG] Started debug_query id={debug_query.id} runId={debug_query.runId}")
-
-    try:
-        print(f"[DEBUG] Started kafka query name={getattr(query, 'name', None)} id={query.id} runId={query.runId}")
-    except Exception:
-        print(f"[DEBUG] Started kafka query id={query.id} runId={query.runId}")
-
-    # Loop and print statuses for each active query
-    while debug_query.isActive or query.isActive:
-        time.sleep(10)
-        for q in (debug_query, query):
-            try:
-                print(f"[DEBUG] name={getattr(q, 'name', None)} id={q.id} runId={q.runId} isActive={q.isActive} status={q.status}")
-                print(f"[DEBUG] Last Progress: {q.lastProgress}")
-            except Exception as e:
-                print(f"[DEBUG] error reading query info: {e}")
 
     # Block until any query terminates
     spark.streams.awaitAnyTermination()
